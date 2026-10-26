@@ -10,25 +10,66 @@ Este programa em C foi desenvolvido de uma forma simples para facilitar o entend
 
 ### Sistemas de projeções
 
-- Eckert IV;
-- Eckert VI;
-- Equal Earth;
-- Equidistante;
-- Gott equal-area elliptical;
-- Gott-Mugnolo azimuthal;
-- Hammer;
-- Kavrayskiy VII;
-- Lambert azimuthal equal-area;
-- Mercator;
-- Miller cylindrical;
-- Mollweide;
-- Natural Earth;
-- Natural Earth II;
-- Patterson;
-- Robinson;
-- Sinusoidal;
-- Wagner VI;
-- Winkel Tripel.
+- Eckert IV (`EckertIV` / `e`);
+- Eckert VI (`EckertVI` / `E`);
+- Equal Earth (`EqualEarth` / `i`);
+- Plate Carrée / Equidistante (`PlateCarree` / `c`);
+- Gott equal-area elliptical (`GottEqualArea` / `g`);
+- Gott-Mugnolo azimuthal (`GottAzimuthal` / `G`);
+- Hammer (`Hammer` / `h`);
+- Kavrayskiy VII (`KavrayskiyVII` / `k`);
+- Lambert azimuthal equal-area (`Lambert` / `l`);
+- Mercator (`Mercator` / `t`);
+- Miller cylindrical (`Miller` / `m`);
+- Mollweide (`Mollweide` / `M`);
+- Natural Earth (`NaturalEarth` / `n`);
+- Natural Earth II (`NaturalEarthII` / `N`);
+- Patterson (`Patterson` / `p`);
+- Robinson (`Robinson` / `r`);
+- Sinusoidal (`Sinusoidal` / `s`);
+- Wagner VI (`WagnerVI` / `w`);
+- Winkel Tripel (`WinkelTripel` / `W`).
+
+### Compilação e Utilização
+
+#### Dependências
+Certifique-se de ter instaladas as bibliotecas de desenvolvimento **`cJSON`** e **`libcsv`**, além do compilador `gcc` (e opcionalmente `make`).
+
+#### Configuração
+O programa lê o arquivo `~/.mapa-mundi.conf` no diretório `$HOME` do usuário contendo os caminhos para os arquivos de dados (um modelo encontra-se em `conf/.mapa-mundi.conf`):
+
+```ini
+CSV_PATH=/caminho/para/lib/worldcities_capital.csv
+GEOJSON_PATH=/caminho/para/lib/ne_110m_admin_0_countries_lakes.geojson
+```
+
+#### Compilação
+Utilizando o `Makefile` na raiz do projeto (gera o executável em `bin/mapamundi`):
+```bash
+make
+```
+Ou diretamente com o `gcc`:
+```bash
+mkdir -p bin
+gcc -Wall -O3 src/mapamundi.c -o bin/mapamundi -lm -lcjson -lcsv
+```
+
+#### Execução
+```bash
+./bin/mapamundi [-t LARGURAxALTURA] [-p PROJEÇÃO] [-o ARQUIVO_SAÍDA] [-c] [-r TAMANHO] [-l] [-h]
+```
+- `-t`: Dimensões da imagem em pixels (padrão: `800x400`);
+- `-p`: Nome ou letra identificadora da projeção (padrão: `PlateCarree`);
+- `-o`: Nome do arquivo SVG gerado (padrão: `<Projecao>.svg`);
+- `-c`: Exibe os pontos das cidades capitais;
+- `-r`: Tamanho (raio) em pixels do ponto que representa uma cidade (requer `-c`; padrão: calculado proporcionalmente à largura da imagem);
+- `-l`: Exibe as linhas de meridianos, paralelos, trópicos e círculos polares;
+- `-h`: Exibe a tela de ajuda.
+
+Exemplo:
+```bash
+./bin/mapamundi -t 1600x800 -p EqualEarth -o EqualEarth.svg -lc -r 4
+```
 
 ### Cálculo da conversão
 

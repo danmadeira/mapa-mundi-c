@@ -2,8 +2,8 @@
  * @file mapamundi.c
  * @author Daniel Madeira
  * @brief Gerador de mapa-múndi em SVG com suporte a múltiplas projeções cartográficas.
- * @version 1.0
- * @date 2026-09-23
+ * @version 1.1
+ * @date 2026-10-26
  *
  * @details Este programa lê dados geográficos de continentes (via GeoJSON)
  * e cidades (via CSV) para gerar um mapa vetorial (SVG) da superfície da Terra.
@@ -17,7 +17,7 @@
  * Utilize o seguinte comando no GCC para compilar, garantindo o link das bibliotecas
  * matemáticas e de parsing:
  * @code
- * gcc -Wall -O3 mapamundi.c -o mapamundi -lm -lcjson -lcsv
+ * gcc -Wall -O3 src/mapamundi.c -o bin/mapamundi -lm -lcjson -lcsv
  * @endcode
  *
  * @copyright Copyright (c) 2026 Daniel Madeira. Todos os direitos reservados.
@@ -29,11 +29,12 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <getopt.h>
 #include <cjson/cJSON.h>
 #include <csv.h>
 
-#define PI 3.14159265359
+#define PI 3.14159265358979323846
 #define MAX_PATH 1024
 #define MAX_LINE 4096
 
@@ -55,6 +56,7 @@ char csv_path[MAX_PATH] = "";
 char geojson_path[MAX_PATH] = "";
 int img_largura = 800;
 int img_altura = 400;
+int raio_cidade = 0;
 char projecao_cod = 'c';
 char output_file[MAX_PATH] = "";
 
@@ -75,7 +77,10 @@ double converter_geografica_para_autalica(double latitude) {
     double e2 = 0.00669437999014;
     double q = (1 - e2) * ((sin(phi) / (1 - e2 * pow(sin(phi), 2))) - (1 / (2 * e)) * log((1 - e * sin(phi)) / (1 + e * sin(phi))));
     double qp = (1 - e2) * ((1 / (1 - e2)) - (1 / (2 * e)) * log((1 - e) / (1 + e)));
-    double latitude_autalica = asin(q / qp);
+    double ratio_q = q / qp;
+    if (ratio_q > 1.0) ratio_q = 1.0;
+    else if (ratio_q < -1.0) ratio_q = -1.0;
+    double latitude_autalica = asin(ratio_q);
     return (latitude_autalica * 180.0 / PI);
 }
 
@@ -88,8 +93,8 @@ double converter_geografica_para_autalica(double latitude) {
  * @param prog_name Nome do executável (geralmente argv[0]).
  */
 void exibir_ajuda(const char *prog_name) {
-    printf("Mapa-múndi em SVG\n");
-    printf("Uso: %s [-t LARGURAxALTURA] [-p PROJEÇÃO] [-o ARQUIVO_SAÍDA] [-c] [-l] [-h]\n\n", prog_name);
+    printf("Mapa-múndi em SVG v1.1 (2026-10-26)\n");
+    printf("Uso: %s [-t LARGURAxALTURA] [-p PROJEÇÃO] [-o ARQUIVO_SAÍDA] [-c] [-r TAMANHO] [-l] [-h]\n\n", prog_name);
     printf("Opções:\n");
     printf("  -t  Dimensões da imagem em pixels (ex: 1200x800). Padrão: 800x400\n");
     printf("  -p  Nome ou letra identificadora da projeção. Padrão: PlateCarree\n");
@@ -99,10 +104,11 @@ void exibir_ajuda(const char *prog_name) {
     printf("              Robinson (r), Sinusoidal (s), WagnerVI (w), WinkelTripel (W).\n");
     printf("  -o  Caminho e nome do arquivo SVG gerado. Padrão: <Projecao>.svg\n");
     printf("  -c  Exibe os pontos das cidades capitais\n");
+    printf("  -r  Tamanho (raio) em pixels do ponto das cidades capitais (requer -c). Padrão: proporcional à largura\n");
     printf("  -l  Exibe as linhas de meridianos, paralelos e trópicos\n");
     printf("  -h  Exibe esta tela de ajuda\n\n");
     printf("Exemplo:\n");
-    printf("  %s -t 1600x800 -p EqualEarth -o mapa.svg -lc\n", prog_name);
+    printf("  %s -t 1600x800 -p EqualEarth -o mapa.svg -lc -r 4\n", prog_name);
 }
 
 /**
@@ -117,14 +123,20 @@ void exibir_ajuda(const char *prog_name) {
  */
 void calcular_eckert_iv(double lat, double lon, double *x, double *y) {
     double theta = lat * (PI / 180.0);
-    double k = (2.0 + (PI / 2.0)) * sin(theta);
-    theta = theta / 2.0;
-    for (int i = 0; i < 10; i++) {
-        double sint = sin(theta);
-        double cost = cos(theta);
-        double v = (theta + sint * cost + 2.0 * sint - k) / (2.0 * cost * (1.0 + cost));
-        theta -= v;
-        if (fabs(v) < 1e-7) break;
+    if (fabs(lat) >= 90.0) {
+        theta = (lat >= 0.0) ? (PI / 2.0) : (-PI / 2.0);
+    } else {
+        double k = (2.0 + (PI / 2.0)) * sin(theta);
+        theta = theta / 2.0;
+        for (int i = 0; i < 10; i++) {
+            double sint = sin(theta);
+            double cost = cos(theta);
+            double denom = 2.0 * cost * (1.0 + cost);
+            if (fabs(denom) < 1e-12) break;
+            double v = (theta + sint * cost + 2.0 * sint - k) / denom;
+            theta -= v;
+            if (fabs(v) < 1e-7) break;
+        }
     }
     double longitude = lon * (PI / 180.0);
     *x = (2.0 / sqrt(PI * (4.0 + PI))) * longitude * (1.0 + cos(theta));
@@ -145,7 +157,9 @@ void calcular_eckert_vi(double lat, double lon, double *x, double *y) {
     double theta = lat * (PI / 180.0);
     double k = (1.0 + (PI / 2.0)) * sin(theta);
     for (int i = 0; i < 10; i++) {
-        double v = (theta + sin(theta) - k) / (1.0 + cos(theta));
+        double denom = 1.0 + cos(theta);
+        if (fabs(denom) < 1e-12) break;
+        double v = (theta + sin(theta) - k) / denom;
         theta -= v;
         if (fabs(v) < 1e-7) break;
     }
@@ -164,22 +178,34 @@ void calcular_eckert_vi(double lat, double lon, double *x, double *y) {
  * @param y   Ponteiro onde será armazenada a coordenada Y cartesiana.
  */
 void calcular_gott_equal_area(double lat, double lon, double *x, double *y) {
-    double longitude = lon;
-    if (longitude == 180.0) longitude -= 1.0;
-    else if (longitude == -180.0) longitude += 1.0;
-    longitude *= (PI / 180.0);
-    double theta = lat * (PI / 180.0);
-    double phi = asin(cos(theta) * sin(longitude / 2.0));
-    double k = PI * sin(phi);
-    double lambda = 0.5 * asin(sin(theta) / cos(phi));
+    double longitude = lon * (PI / 180.0);
+    double lat_rad = lat * (PI / 180.0);
+    double sin_phi = cos(lat_rad) * sin(longitude / 2.0);
+    if (sin_phi > 1.0) sin_phi = 1.0;
+    else if (sin_phi < -1.0) sin_phi = -1.0;
+    double phi = asin(sin_phi);
+    double cos_phi = cos(phi);
+    double lambda;
+    if (fabs(cos_phi) < 1e-12) {
+        lambda = 0.0;
+    } else {
+        double ratio_s = sin(lat_rad) / cos_phi;
+        if (ratio_s > 1.0) ratio_s = 1.0;
+        else if (ratio_s < -1.0) ratio_s = -1.0;
+        lambda = 0.5 * asin(ratio_s);
+    }
+    double theta = phi;
+    double k = PI * sin_phi;
     int fim = 1;
     for (int i = 0; i < 10; i++) {
-        double v = (theta + sin(theta) - k) / (1.0 + cos(theta));
+        double denom = 1.0 + cos(theta);
+        if (fabs(denom) < 1e-12) break;
+        double v = (theta + sin(theta) - k) / denom;
         theta -= v;
         if (fabs(v) < 1e-7) { fim = 0; break; }
     }
     if (fim) {
-        if (theta < 0) theta = -PI / 2.0;
+        if (phi < 0) theta = -PI / 2.0;
         else theta = PI / 2.0;
     } else {
         theta *= 0.5;
@@ -198,9 +224,17 @@ void calcular_gott_equal_area(double lat, double lon, double *x, double *y) {
  * @param y   Ponteiro onde será armazenada a coordenada Y cartesiana.
  */
 void calcular_gott_azimuthal(double lat, double lon, double *x, double *y) {
+    if (fabs(lat) < 1e-12 && fabs(fabs(lon) - 180.0) < 1e-9) {
+        *x = (lon >= 0.0) ? sin(0.446 * PI) : -sin(0.446 * PI);
+        *y = 0.0;
+        return;
+    }
     double latitude = lat * (PI / 180.0);
     double longitude = lon * (PI / 180.0);
-    double c = acos(cos(latitude) * cos(longitude));
+    double prod = cos(latitude) * cos(longitude);
+    if (prod > 1.0) prod = 1.0;
+    else if (prod < -1.0) prod = -1.0;
+    double c = acos(prod);
     if (c < 1e-10) {
         *x = 0; *y = 0;
     } else {
@@ -226,7 +260,9 @@ void calcular_gott_azimuthal(double lat, double lon, double *x, double *y) {
 void calcular_hammer(double lat, double lon, double *x, double *y) {
     double latitude = lat * (PI / 180.0);
     double longitude = lon * (PI / 180.0);
-    double eta = sqrt(1.0 + cos(latitude) * cos(longitude / 2.0));
+    double radicando = 1.0 + cos(latitude) * cos(longitude / 2.0);
+    if (radicando < 1e-12) radicando = 1e-12;
+    double eta = sqrt(radicando);
     *x = (2.0 * sqrt(2.0) * cos(latitude) * sin(longitude / 2.0)) / eta;
     *y = (sqrt(2.0) * sin(latitude)) / eta;
 }
@@ -245,7 +281,10 @@ void calcular_equal_earth(double lat, double lon, double *x, double *y) {
     double longitude = lon * (PI / 180.0);
     double sqrt3 = sqrt(3.0);
     double A1 = 1.340264, A2 = -0.081106, A3 = 0.000893, A4 = 0.003796;
-    double theta = asin((sqrt3 / 2.0) * sin(latitude));
+    double arg = (sqrt3 / 2.0) * sin(latitude);
+    if (arg > 1.0) arg = 1.0;
+    else if (arg < -1.0) arg = -1.0;
+    double theta = asin(arg);
     double t2 = pow(theta, 2);
     double t6 = pow(theta, 6);
     *x = (2.0 * sqrt3 * longitude * cos(theta)) / (3.0 * (A1 + 3.0 * A2 * t2 + t6 * (7.0 * A3 + 9.0 * A4 * t2)));
@@ -264,7 +303,9 @@ void calcular_equal_earth(double lat, double lon, double *x, double *y) {
 void calcular_kavrayskiy_vii(double lat, double lon, double *x, double *y) {
     double latitude = lat * (PI / 180.0);
     double longitude = lon * (PI / 180.0);
-    *x = (3.0 * longitude / 2.0) * sqrt(1.0 / 3.0 - pow(latitude / PI, 2));
+    double radicando = 1.0 / 3.0 - pow(latitude / PI, 2);
+    if (radicando < 0.0) radicando = 0.0;
+    *x = (3.0 * longitude / 2.0) * sqrt(radicando);
     *y = latitude;
 }
 
@@ -278,6 +319,11 @@ void calcular_kavrayskiy_vii(double lat, double lon, double *x, double *y) {
  * @param y   Ponteiro onde será armazenada a coordenada Y cartesiana.
  */
 void calcular_lambert_azimuthal(double lat, double lon, double *x, double *y) {
+    if (fabs(lat) < 1e-12 && fabs(fabs(lon) - 180.0) < 1e-9) {
+        *x = (lon >= 0.0) ? 2.0 : -2.0;
+        *y = 0.0;
+        return;
+    }
     double latitude = lat * (PI / 180.0);
     double longitude = lon * (PI / 180.0);
     double denominador = 1.0 + cos(latitude) * cos(longitude);
@@ -315,18 +361,24 @@ void calcular_miller(double lat, double lon, double *x, double *y) {
  */
 void calcular_mollweide(double lat, double lon, double *x, double *y) {
     double theta = lat * (PI / 180.0);
-    double k = PI * sin(theta);
-    int fim = 1;
-    for (int i = 0; i < 10; i++) {
-        double v = (theta + sin(theta) - k) / (1.0 + cos(theta));
-        theta -= v;
-        if (fabs(v) < 1e-7) { fim = 0; break; }
-    }
-    if (fim) {
-        if (theta < 0) theta = -PI / 2.0;
-        else theta = PI / 2.0;
+    if (fabs(lat) >= 90.0) {
+        theta = (lat < 0) ? (-PI / 2.0) : (PI / 2.0);
     } else {
-        theta *= 0.5;
+        double k = PI * sin(theta);
+        int fim = 1;
+        for (int i = 0; i < 10; i++) {
+            double denom = 1.0 + cos(theta);
+            if (fabs(denom) < 1e-12) break;
+            double v = (theta + sin(theta) - k) / denom;
+            theta -= v;
+            if (fabs(v) < 1e-7) { fim = 0; break; }
+        }
+        if (fim) {
+            if (lat < 0) theta = -PI / 2.0;
+            else theta = PI / 2.0;
+        } else {
+            theta *= 0.5;
+        }
     }
     *x = (2.0 * sqrt(2.0) / PI) * (lon * (PI / 180.0)) * cos(theta);
     *y = sqrt(2.0) * sin(theta);
@@ -447,7 +499,9 @@ void calcular_mercator(double lat, double lon, double *x, double *y) {
  */
 void calcular_wagner_vi(double lat, double lon, double *x, double *y) {
     double latitude = lat * (PI / 180.0);
-    *x = (lon * (PI / 180.0)) * sqrt(1.0 - 3.0 * pow(latitude / PI, 2));
+    double radicando = 1.0 - 3.0 * pow(latitude / PI, 2);
+    if (radicando < 0.0) radicando = 0.0;
+    *x = (lon * (PI / 180.0)) * sqrt(radicando);
     *y = latitude;
 }
 
@@ -463,10 +517,149 @@ void calcular_wagner_vi(double lat, double lon, double *x, double *y) {
 void calcular_winkel_iii(double lat, double lon, double *x, double *y) {
     double latitude = lat * (PI / 180.0);
     double longitude = lon * (PI / 180.0);
-    double alpha = acos(cos(latitude) * cos(longitude / 2.0));
+    double prod = cos(latitude) * cos(longitude / 2.0);
+    if (prod > 1.0) prod = 1.0;
+    else if (prod < -1.0) prod = -1.0;
+    double alpha = acos(prod);
     double sinc = (alpha == 0) ? 1.0 : sin(alpha) / alpha;
     *x = (1.0 / 2.0) * (longitude * cos(acos(2.0 / PI)) + ((2.0 * cos(latitude) * sin(longitude / 2.0)) / sinc));
     *y = (1.0 / 2.0) * (latitude + (sin(latitude) / sinc));
+}
+
+/**
+ * @brief Obtém os limites cartesianos máximos (semi-eixos X e Y) da projeção.
+ *
+ * Calcula a extensão máxima horizontal (no Equador, longitude 180°) e vertical
+ * (no polo Norte, latitude 90°) para a projeção selecionada, permitindo
+ * determinar a proporção nativa e o fator de escala exato do mapa.
+ *
+ * @param projecao Caractere que identifica a projeção.
+ * @param x_max    Ponteiro onde será armazenado o limite máximo no eixo X.
+ * @param y_max    Ponteiro onde será armazenado o limite máximo no eixo Y.
+ */
+void obter_limites_projecao(char projecao, double *x_max, double *y_max) {
+    static char ultima_projecao = '\0';
+    static double cache_x_max = 0.0;
+    static double cache_y_max = 0.0;
+
+    if (projecao == ultima_projecao && ultima_projecao != '\0') {
+        *x_max = cache_x_max;
+        *y_max = cache_y_max;
+        return;
+    }
+
+    double dummy;
+    switch (projecao) {
+        case 'e':
+            calcular_eckert_iv(0, 180, x_max, &dummy);
+            calcular_eckert_iv(90, 0, &dummy, y_max);
+            break;
+        case 'E':
+            calcular_eckert_vi(0, 180, x_max, &dummy);
+            calcular_eckert_vi(90, 0, &dummy, y_max);
+            break;
+        case 'g':
+            calcular_gott_equal_area(0, 180, x_max, &dummy);
+            calcular_gott_equal_area(90, 0, &dummy, y_max);
+            break;
+        case 'G':
+            *x_max = sin(0.446 * PI);
+            *y_max = sin(0.446 * PI);
+            break;
+        case 'h':
+            calcular_hammer(0, 180, x_max, &dummy);
+            calcular_hammer(90, 0, &dummy, y_max);
+            break;
+        case 'i':
+            calcular_equal_earth(converter_geografica_para_autalica(0), 180, x_max, &dummy);
+            calcular_equal_earth(converter_geografica_para_autalica(90), 0, &dummy, y_max);
+            break;
+        case 'k':
+            calcular_kavrayskiy_vii(0, 180, x_max, &dummy);
+            calcular_kavrayskiy_vii(90, 0, &dummy, y_max);
+            break;
+        case 'l':
+            *x_max = 2.0;
+            *y_max = 2.0;
+            break;
+        case 'm':
+            calcular_miller(0, 180, x_max, &dummy);
+            calcular_miller(90, 0, &dummy, y_max);
+            break;
+        case 'M':
+            calcular_mollweide(0, 180, x_max, &dummy);
+            calcular_mollweide(90, 0, &dummy, y_max);
+            break;
+        case 'n':
+            calcular_natural_earth(0, 180, x_max, &dummy);
+            calcular_natural_earth(90, 0, &dummy, y_max);
+            break;
+        case 'N':
+            calcular_natural_earth_ii(0, 180, x_max, &dummy);
+            calcular_natural_earth_ii(90, 0, &dummy, y_max);
+            break;
+        case 'p':
+            calcular_patterson(0, 180, x_max, &dummy);
+            calcular_patterson(90, 0, &dummy, y_max);
+            break;
+        case 'r':
+            calcular_robinson(0, 180, x_max, &dummy);
+            calcular_robinson(90, 0, &dummy, y_max);
+            break;
+        case 's':
+            calcular_sinusoidal(0, 180, x_max, &dummy);
+            calcular_sinusoidal(90, 0, &dummy, y_max);
+            break;
+        case 't':
+            calcular_mercator(0, 180, x_max, &dummy);
+            calcular_mercator(90, 0, &dummy, y_max);
+            break;
+        case 'w':
+            calcular_wagner_vi(0, 180, x_max, &dummy);
+            calcular_wagner_vi(90, 0, &dummy, y_max);
+            break;
+        case 'W':
+            calcular_winkel_iii(0, 180, x_max, &dummy);
+            calcular_winkel_iii(90, 0, &dummy, y_max);
+            break;
+        case 'c':
+        default:
+            *x_max = 180.0;
+            *y_max = 90.0;
+            break;
+    }
+
+    ultima_projecao = projecao;
+    cache_x_max = *x_max;
+    cache_y_max = *y_max;
+}
+
+/**
+ * @brief Ajusta a largura e a altura da imagem para a dimensão útil da projeção.
+ *
+ * A partir das dimensões máximas fornecidas pelo utilizador, calcula o tamanho
+ * real ocupado pelo globo terrestre na projeção escolhida, eliminando bordas
+ * transparentes excedentes no ficheiro SVG final.
+ *
+ * @param largura  Ponteiro para a largura da imagem em pixels (entrada/saída).
+ * @param altura   Ponteiro para a altura da imagem em pixels (entrada/saída).
+ * @param projecao Caractere que identifica a projeção selecionada.
+ */
+void ajustar_dimensoes_uteis(int *largura, int *altura, char projecao) {
+    double x_max, y_max;
+    obter_limites_projecao(projecao, &x_max, &y_max);
+
+    double modulo_x = *largura / (x_max * 2.0);
+    double modulo_y = *altura / (y_max * 2.0);
+
+    if (modulo_x < modulo_y) {
+        *altura = (int)round(y_max * 2.0 * modulo_x);
+    } else {
+        *largura = (int)round(x_max * 2.0 * modulo_y);
+    }
+
+    if (*largura < 1) *largura = 1;
+    if (*altura < 1) *altura = 1;
 }
 
 /**
@@ -486,110 +679,46 @@ void calcular_winkel_iii(double lat, double lon, double *x, double *y) {
 CoordenadaXY converter_geo_pixel(double latitude, double longitude, int largura, int altura, char projecao) {
     CoordenadaXY centro = { largura / 2.0, altura / 2.0 };
     CoordenadaXY xy;
-    double modulo;
-    double ratio = (double)largura / altura;
-    double x_proj, y_proj, dummy;
+    double x_proj, y_proj, x_max, y_max;
 
     switch (projecao) {
-        case 'e':
-            calcular_eckert_iv(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 2.002) { calcular_eckert_iv(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_eckert_iv(89.941328, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'E':
-            calcular_eckert_vi(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 2.0) { calcular_eckert_vi(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_eckert_vi(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'g':
-            calcular_gott_equal_area(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.621) { calcular_gott_equal_area(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_gott_equal_area(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'G':
-            calcular_gott_azimuthal(latitude, longitude, &x_proj, &y_proj);
-            modulo = (ratio < 1.0) ? largura / (sin(0.446 * PI) * 2) : altura / (sin(0.446 * PI) * 2);
-            break;
-        case 'h':
-            calcular_hammer(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 2.0) { calcular_hammer(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_hammer(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'i':
-            calcular_equal_earth(converter_geografica_para_autalica(latitude), longitude, &x_proj, &y_proj);
-            if (ratio < 2.05) { calcular_equal_earth(converter_geografica_para_autalica(0), 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_equal_earth(converter_geografica_para_autalica(90), 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'k':
-            calcular_kavrayskiy_vii(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.733) { calcular_kavrayskiy_vii(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_kavrayskiy_vii(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'l':
-            calcular_lambert_azimuthal(latitude, longitude, &x_proj, &y_proj);
-            modulo = (ratio < 1.0) ? largura / 4.0 : altura / 4.0;
-            break;
-        case 'm':
-            calcular_miller(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.363) { calcular_miller(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_miller(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'M':
-            calcular_mollweide(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 2.0) { calcular_mollweide(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_mollweide(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'n':
-            calcular_natural_earth(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.923) { calcular_natural_earth(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_natural_earth(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'N':
-            calcular_natural_earth_ii(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.869) { calcular_natural_earth_ii(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_natural_earth_ii(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'p':
-            calcular_patterson(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.755) { calcular_patterson(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_patterson(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'r':
-            calcular_robinson(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.969) { calcular_robinson(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_robinson(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 's':
-            calcular_sinusoidal(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 2.0) { calcular_sinusoidal(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_sinusoidal(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 't':
-            calcular_mercator(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.0) { calcular_mercator(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_mercator(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'w':
-            calcular_wagner_vi(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 2.0) { calcular_wagner_vi(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_wagner_vi(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
-        case 'W':
-            calcular_winkel_iii(latitude, longitude, &x_proj, &y_proj);
-            if (ratio < 1.637) { calcular_winkel_iii(0, 180, &modulo, &dummy); modulo = largura / (modulo * 2); }
-            else { calcular_winkel_iii(90, 0, &dummy, &modulo); modulo = altura / (modulo * 2); }
-            break;
+        case 'e': calcular_eckert_iv(latitude, longitude, &x_proj, &y_proj); break;
+        case 'E': calcular_eckert_vi(latitude, longitude, &x_proj, &y_proj); break;
+        case 'g': calcular_gott_equal_area(latitude, longitude, &x_proj, &y_proj); break;
+        case 'G': calcular_gott_azimuthal(latitude, longitude, &x_proj, &y_proj); break;
+        case 'h': calcular_hammer(latitude, longitude, &x_proj, &y_proj); break;
+        case 'i': calcular_equal_earth(converter_geografica_para_autalica(latitude), longitude, &x_proj, &y_proj); break;
+        case 'k': calcular_kavrayskiy_vii(latitude, longitude, &x_proj, &y_proj); break;
+        case 'l': calcular_lambert_azimuthal(latitude, longitude, &x_proj, &y_proj); break;
+        case 'm': calcular_miller(latitude, longitude, &x_proj, &y_proj); break;
+        case 'M': calcular_mollweide(latitude, longitude, &x_proj, &y_proj); break;
+        case 'n': calcular_natural_earth(latitude, longitude, &x_proj, &y_proj); break;
+        case 'N': calcular_natural_earth_ii(latitude, longitude, &x_proj, &y_proj); break;
+        case 'p': calcular_patterson(latitude, longitude, &x_proj, &y_proj); break;
+        case 'r': calcular_robinson(latitude, longitude, &x_proj, &y_proj); break;
+        case 's': calcular_sinusoidal(latitude, longitude, &x_proj, &y_proj); break;
+        case 't': calcular_mercator(latitude, longitude, &x_proj, &y_proj); break;
+        case 'w': calcular_wagner_vi(latitude, longitude, &x_proj, &y_proj); break;
+        case 'W': calcular_winkel_iii(latitude, longitude, &x_proj, &y_proj); break;
         case 'c':
         default:
             x_proj = longitude; // * (PI / 180.0);
             y_proj = latitude; // * (PI / 180.0);
-            if (ratio < 2.0) modulo = largura / 360.0;
-            else modulo = altura / 180.0;
             break;
     }
 
-    xy.x = floor(centro.x + (x_proj * modulo));
-    xy.y = floor(centro.y - (y_proj * modulo));
+    obter_limites_projecao(projecao, &x_max, &y_max);
+    double modulo_x = largura / (x_max * 2.0);
+    double modulo_y = altura / (y_max * 2.0);
+    double modulo;
+    if (modulo_x < modulo_y) {
+        modulo = ((int)round(x_max * 2.0 * modulo_y) <= largura) ? modulo_y : modulo_x;
+    } else {
+        modulo = ((int)round(y_max * 2.0 * modulo_x) <= altura) ? modulo_x : modulo_y;
+    }
+
+    xy.x = round(centro.x + (x_proj * modulo));
+    xy.y = round(centro.y - (y_proj * modulo));
     return xy;
 }
 
@@ -598,13 +727,15 @@ CoordenadaXY converter_geo_pixel(double latitude, double longitude, int largura,
  *
  * Compara a string de entrada com os nomes por extenso das projeções suportadas
  * e devolve o respetivo caractere identificador único. Se a entrada já for um único
- * caractere, devolve-o diretamente.
+ * caractere válido, devolve-o diretamente; caso contrário devolve '\0'.
  *
  * @param nome String contendo o nome da projeção ou o seu caractere identificador.
- * @return O caractere ('a'-'Z') correspondente à projeção (ex: 'c' para PlateCarree).
+ * @return O caractere ('a'-'Z') correspondente à projeção (ex: 'c' para PlateCarree), ou '\0' se inválido.
  */
 char identificar_projecao(const char* nome) {
-    if (strlen(nome) == 1) return nome[0];
+    if (strlen(nome) == 1) {
+        return (strchr("eEigGhklmtMnNpcrsWw", nome[0]) != NULL) ? nome[0] : '\0';
+    }
     if (!strcmp(nome, "EckertIV")) return 'e';
     if (!strcmp(nome, "EckertVI")) return 'E';
     if (!strcmp(nome, "EqualEarth")) return 'i';
@@ -619,12 +750,12 @@ char identificar_projecao(const char* nome) {
     if (!strcmp(nome, "NaturalEarth")) return 'n';
     if (!strcmp(nome, "NaturalEarthII")) return 'N';
     if (!strcmp(nome, "Patterson")) return 'p';
-    if (!strcmp(nome, "PlateCarree")) return 'c';
+    if (!strcmp(nome, "PlateCarree") || !strcmp(nome, "Equidistante")) return 'c';
     if (!strcmp(nome, "Robinson")) return 'r';
     if (!strcmp(nome, "Sinusoidal")) return 's';
     if (!strcmp(nome, "WagnerVI")) return 'w';
     if (!strcmp(nome, "WinkelTripel")) return 'W';
-    return 'c';
+    return '\0';
 }
 
 /**
@@ -667,8 +798,10 @@ const char* obter_nome_projecao(char id) {
  * Procura o ficheiro `.mapa-mundi.conf` no diretório HOME do utilizador
  * para carregar os caminhos predefinidos dos ficheiros CSV (cidades) e GeoJSON (continentes).
  * Em caso de falha na leitura, encerra o programa com erro.
+ *
+ * @param exigir_csv Indica se a existência do ficheiro CSV deve ser validada obrigatoriamente.
  */
-void ler_configuracao() {
+void ler_configuracao(int exigir_csv) {
     char *home = getenv("HOME");
     if (!home) {
         fprintf(stderr, "Erro: Variável de ambiente HOME não encontrada.\n");
@@ -692,18 +825,19 @@ void ler_configuracao() {
     
     char linha[MAX_LINE];
     while (fgets(linha, sizeof(linha), file)) {
-        if (strncmp(linha, "CSV_PATH=", 9) == 0) sscanf(linha, "CSV_PATH=%[^\n]", csv_path);
-        else if (strncmp(linha, "GEOJSON_PATH=", 13) == 0) sscanf(linha, "GEOJSON_PATH=%[^\n]", geojson_path);
+        if (strncmp(linha, "CSV_PATH=", 9) == 0) sscanf(linha, "CSV_PATH=%1023[^\r\n]", csv_path);
+        else if (strncmp(linha, "GEOJSON_PATH=", 13) == 0) sscanf(linha, "GEOJSON_PATH=%1023[^\r\n]", geojson_path);
     }
     fclose(file);
     
-    if (strlen(csv_path) == 0 || access(csv_path, F_OK) != 0) {
+    struct stat st;
+    if (exigir_csv && (strlen(csv_path) == 0 || stat(csv_path, &st) != 0 || !S_ISREG(st.st_mode))) {
         fprintf(stderr, "Erro: Arquivo CSV não encontrado ou caminho inválido.\n");
         fprintf(stderr, "Caminho lido: '%s'\n", csv_path);
         exit(EXIT_FAILURE);
     }
     
-    if (strlen(geojson_path) == 0 || access(geojson_path, F_OK) != 0) {
+    if (strlen(geojson_path) == 0 || stat(geojson_path, &st) != 0 || !S_ISREG(st.st_mode)) {
         fprintf(stderr, "Erro: Arquivo GeoJSON não encontrado ou caminho inválido.\n");
         fprintf(stderr, "Caminho lido: '%s'\n", geojson_path);
         exit(EXIT_FAILURE);
@@ -726,19 +860,28 @@ void desenhar_continentes_geojson(FILE *svg) {
         return;
     }
 
-    fseek(geo, 0, SEEK_END);
+    if (fseek(geo, 0, SEEK_END) != 0) {
+        fprintf(stderr, "Erro ao posicionar no arquivo GeoJSON.\n");
+        fclose(geo);
+        return;
+    }
     long length = ftell(geo);
+    if (length <= 0) {
+        fprintf(stderr, "Erro: Arquivo GeoJSON vazio ou inválido.\n");
+        fclose(geo);
+        return;
+    }
     fseek(geo, 0, SEEK_SET);
 
-    char *data = (char *)malloc(length + 1);
+    char *data = (char *)malloc((size_t)length + 1);
     if (!data) {
         fprintf(stderr, "Erro de alocação de memória para o GeoJSON.\n");
         fclose(geo);
         return;
     }
 
-    fread(data, 1, length, geo);
-    data[length] = '\0';
+    size_t lidos = fread(data, 1, (size_t)length, geo);
+    data[lidos] = '\0';
     fclose(geo);
 
     cJSON *json = cJSON_Parse(data);
@@ -773,20 +916,30 @@ void desenhar_continentes_geojson(FILE *svg) {
         if (strcmp(type->valuestring, "Polygon") == 0) {
             cJSON *ring;
             cJSON_ArrayForEach(ring, coordinates) {
-                fprintf(svg, "<polygon points=\"");
+                int aberto = 0;
                 cJSON *coord;
                 cJSON_ArrayForEach(coord, ring) {
                     if (cJSON_GetArraySize(coord) >= 2) {
-                        double lon = cJSON_GetArrayItem(coord, 0)->valuedouble;
-                        double lat = cJSON_GetArrayItem(coord, 1)->valuedouble;
+                        cJSON *item_lon = cJSON_GetArrayItem(coord, 0);
+                        cJSON *item_lat = cJSON_GetArrayItem(coord, 1);
+                        if (cJSON_IsNumber(item_lon) && cJSON_IsNumber(item_lat)) {
+                            double lon = item_lon->valuedouble;
+                            double lat = item_lat->valuedouble;
 
-                        if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
-                            CoordenadaXY xy = converter_geo_pixel(lat, lon, img_largura, img_altura, projecao_cod);
-                            fprintf(svg, "%.0f,%.0f ", xy.x, xy.y);
+                            if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
+                                if (!aberto) {
+                                    fprintf(svg, "<polygon points=\"");
+                                    aberto = 1;
+                                }
+                                CoordenadaXY xy = converter_geo_pixel(lat, lon, img_largura, img_altura, projecao_cod);
+                                fprintf(svg, "%.0f,%.0f ", xy.x, xy.y);
+                            }
                         }
                     }
                 }
-                fprintf(svg, "\" />\n");
+                if (aberto) {
+                    fprintf(svg, "\" />\n");
+                }
             }
         }
         else if (strcmp(type->valuestring, "MultiPolygon") == 0) {
@@ -794,20 +947,30 @@ void desenhar_continentes_geojson(FILE *svg) {
             cJSON_ArrayForEach(polygon, coordinates) {
                 cJSON *ring;
                 cJSON_ArrayForEach(ring, polygon) {
-                    fprintf(svg, "<polygon points=\"");
+                    int aberto = 0;
                     cJSON *coord;
                     cJSON_ArrayForEach(coord, ring) {
                         if (cJSON_GetArraySize(coord) >= 2) {
-                            double lon = cJSON_GetArrayItem(coord, 0)->valuedouble;
-                            double lat = cJSON_GetArrayItem(coord, 1)->valuedouble;
+                            cJSON *item_lon = cJSON_GetArrayItem(coord, 0);
+                            cJSON *item_lat = cJSON_GetArrayItem(coord, 1);
+                            if (cJSON_IsNumber(item_lon) && cJSON_IsNumber(item_lat)) {
+                                double lon = item_lon->valuedouble;
+                                double lat = item_lat->valuedouble;
 
-                            if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
-                                CoordenadaXY xy = converter_geo_pixel(lat, lon, img_largura, img_altura, projecao_cod);
-                                fprintf(svg, "%.0f,%.0f ", xy.x, xy.y);
+                                if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
+                                    if (!aberto) {
+                                        fprintf(svg, "<polygon points=\"");
+                                        aberto = 1;
+                                    }
+                                    CoordenadaXY xy = converter_geo_pixel(lat, lon, img_largura, img_altura, projecao_cod);
+                                    fprintf(svg, "%.0f,%.0f ", xy.x, xy.y);
+                                }
                             }
                         }
                     }
-                    fprintf(svg, "\" />\n");
+                    if (aberto) {
+                        fprintf(svg, "\" />\n");
+                    }
                 }
             }
         }
@@ -841,10 +1004,14 @@ void cb_campo(void *s, size_t len, void *data) {
         strncpy(buffer_temp, (char *)s, copy_len);
         buffer_temp[copy_len] = '\0';
 
-        if (ctx->coluna_atual == 2) {
-            ctx->lat = atof(buffer_temp);
-        } else if (ctx->coluna_atual == 3) {
-            ctx->lon = atof(buffer_temp);
+        char *endptr;
+        double val = strtod(buffer_temp, &endptr);
+        if (copy_len > 0 && endptr != buffer_temp && *endptr == '\0' && isfinite(val)) {
+            if (ctx->coluna_atual == 2) {
+                ctx->lat = val;
+            } else if (ctx->coluna_atual == 3) {
+                ctx->lon = val;
+            }
         }
     }
 
@@ -862,6 +1029,7 @@ void cb_campo(void *s, size_t len, void *data) {
  * @param data Ponteiro de contexto customizado (ContextoCSV) partilhado com a libcsv.
  */
 void cb_linha(int c, void *data) {
+    (void)c;
     ContextoCSV *ctx = (ContextoCSV *)data;
 
     if (ctx->is_header) {
@@ -899,7 +1067,7 @@ void desenhar_cidades_csv(FILE *svg) {
 
     fprintf(svg, "<g fill=\"rgb(33,42,116)\" stroke-width=\"0\">\n");
 
-    int r = (int)round(img_largura * 0.003);
+    int r = (raio_cidade > 0) ? raio_cidade : (int)round(img_largura * 0.003);
     if (r < 1) r = 1;
 
     struct csv_parser parser;
@@ -920,14 +1088,18 @@ void desenhar_cidades_csv(FILE *svg) {
     char buffer[1024];
     size_t bytes_lidos;
 
+    int erro_csv = 0;
     while ((bytes_lidos = fread(buffer, 1, sizeof(buffer), csv_file)) > 0) {
         if (csv_parse(&parser, buffer, bytes_lidos, cb_campo, cb_linha, &ctx) != bytes_lidos) {
             fprintf(stderr, "Erro de parseamento CSV: %s\n", csv_strerror(csv_error(&parser)));
+            erro_csv = 1;
             break;
         }
     }
 
-    csv_fini(&parser, cb_campo, cb_linha, &ctx);
+    if (!erro_csv) {
+        csv_fini(&parser, cb_campo, cb_linha, &ctx);
+    }
     csv_free(&parser);
 
     fprintf(svg, "</g>\n");
@@ -964,8 +1136,15 @@ void desenhar_linhas_grade(FILE *svg) {
         CoordenadaXY xy = converter_geo_pixel(-90.0, lon, img_largura, img_altura, projecao_cod);
         fprintf(svg, "<path d=\"M%.0f,%.0f", xy.x, xy.y);
         for (int lat = -90 + passo_curva; lat <= 90; lat += passo_curva) {
+            if ((projecao_cod == 'l' || projecao_cod == 'G') && abs(lon) == 180 && lat == 0) {
+                continue;
+            }
             xy = converter_geo_pixel(lat, lon, img_largura, img_altura, projecao_cod);
-            fprintf(svg, " L%.0f,%.0f", xy.x, xy.y);
+            if ((projecao_cod == 'l' || projecao_cod == 'G') && abs(lon) == 180 && lat == passo_curva) {
+                fprintf(svg, " M%.0f,%.0f", xy.x, xy.y);
+            } else {
+                fprintf(svg, " L%.0f,%.0f", xy.x, xy.y);
+            }
         }
         fprintf(svg, "\" />\n");
     }
@@ -1063,24 +1242,29 @@ void desenhar_fundo_azul(FILE *svg) {
  * @return EXIT_SUCCESS caso termine com sucesso, ou EXIT_FAILURE em caso de erro.
  */
 int main(int argc, char *argv[]) {
-    if (argc == 1) {
-        exibir_ajuda(argv[0]);
-        return EXIT_SUCCESS;
-    }
-
     int opt;
+    char extra;
     char projecao_nome[50] = "PlateCarree";
     int opt_desenhar_cidades = 0;
     int opt_desenhar_grade = 0;
     
-    ler_configuracao();
-    
-    while ((opt = getopt(argc, argv, "t:p:o:hcl")) != -1) {
+    while ((opt = getopt(argc, argv, "t:p:o:r:hcl")) != -1) {
         switch (opt) {
-            case 't': sscanf(optarg, "%dx%d", &img_largura, &img_altura); break;
+            case 't':
+                if (sscanf(optarg, "%dx%d%c", &img_largura, &img_altura, &extra) != 2 || img_largura <= 0 || img_altura <= 0) {
+                    fprintf(stderr, "Erro: Dimensões inválidas: '%s'. Use LARGURAxALTURA com valores positivos.\n", optarg);
+                    return EXIT_FAILURE;
+                }
+                break;
             case 'p': snprintf(projecao_nome, sizeof(projecao_nome), "%s", optarg); break;
             case 'o': snprintf(output_file, sizeof(output_file), "%s", optarg); break;
             case 'c': opt_desenhar_cidades = 1; break;
+            case 'r':
+                if (sscanf(optarg, "%d%c", &raio_cidade, &extra) != 1 || raio_cidade <= 0) {
+                    fprintf(stderr, "Erro: Tamanho do ponto inválido: '%s'. Use um valor inteiro positivo em pixels.\n", optarg);
+                    return EXIT_FAILURE;
+                }
+                break;
             case 'l': opt_desenhar_grade = 1; break;
             case 'h': 
                 exibir_ajuda(argv[0]); 
@@ -1090,8 +1274,28 @@ int main(int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
     }
+
+    if (optind < argc) {
+        fprintf(stderr, "Erro: Argumento inesperado: '%s'.\n\n", argv[optind]);
+        exibir_ajuda(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    if (raio_cidade > 0 && !opt_desenhar_cidades) {
+        fprintf(stderr, "Erro: O parâmetro '-r' requer o uso do parâmetro '-c'.\n\n");
+        exibir_ajuda(argv[0]);
+        return EXIT_FAILURE;
+    }
     
     projecao_cod = identificar_projecao(projecao_nome);
+    if (projecao_cod == '\0') {
+        fprintf(stderr, "Erro: Projeção inválida: '%s'.\n\n", projecao_nome);
+        exibir_ajuda(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    ler_configuracao(opt_desenhar_cidades);
+    ajustar_dimensoes_uteis(&img_largura, &img_altura, projecao_cod);
 
     const char *nome_completo = obter_nome_projecao(projecao_cod);
 
